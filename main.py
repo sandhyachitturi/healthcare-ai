@@ -1,32 +1,27 @@
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 import anthropic
+import asyncio
 import os
 from dotenv import load_dotenv
 
-# Load your API key from .env file
 load_dotenv()
-
-# Create the FastAPI app
 app = FastAPI()
 
-# Create the Anthropic client
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+# ASYNC client — note AsyncAnthropic, not Anthropic
+client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-# Request model — what comes IN
 class ClinicalQuery(BaseModel):
     question: str = Field(min_length=3, max_length=2000)
 
-# Response model — what goes OUT
 class ClinicalResponse(BaseModel):
     answer: str
     model_used: str
     question_received: str
 
-# The endpoint
 @app.post("/ask", response_model=ClinicalResponse)
 async def ask_clinical(query: ClinicalQuery):
-    message = client.messages.create(
+    message = await client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=500,
         system="You are a clinical decision support assistant.",
@@ -37,3 +32,9 @@ async def ask_clinical(query: ClinicalQuery):
         model_used="claude-sonnet-4-6",
         question_received=query.question
     )
+
+# Proof-of-concept endpoint — simulates a slow task
+@app.get("/slow-test")
+async def slow_test():
+    await asyncio.sleep(5)
+    return {"message": "Done waiting 5 seconds"}
