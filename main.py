@@ -1,12 +1,18 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 import anthropic
+import logging
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 app = FastAPI()
 client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+# Basic logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("healthcare-ai")
 
 CLINICAL_SYSTEM_PROMPT = """You are a clinical decision support assistant for healthcare providers.
 
@@ -23,8 +29,6 @@ Your boundaries:
 
 Format your answers clearly, using brief structure (like short lists) when it improves readability for a busy clinician."""
 
-# Simple in-memory store — NOTE: resets every time the server restarts.
-# Day 5 goal is to understand the PATTERN, not build production storage yet.
 conversation_store: dict[str, list[dict]] = {}
 
 class ClinicalQuery(BaseModel):
@@ -39,24 +43,35 @@ class ClinicalResponse(BaseModel):
 
 @app.post("/ask", response_model=ClinicalResponse)
 async def ask_clinical(query: ClinicalQuery):
-    # Load this session's past turns (or start fresh)
     history = conversation_store.get(query.session_id, [])
-
-    # Add the new user message to the running history
     history.append({"role": "user", "content": query.question})
 
-    message = await client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=500,
-        system=CLINICAL_SYSTEM_PROMPT,
-        messages=history  # send the FULL history, not just this one question
-    )
+    try:
+        logger.info(f"Session {query.session_id}: sending question to Claude")
+        message = await client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            system=CLINICAL_SYSTEM_PROMPT,
+            messages=history
+        )
+    except anthropic.AuthenticationError:
+        logger.error("Authentication failed — check ANTHROPIC_API_KEY")
+        raise HTTPException(status_code=500, detail="Server configuration error. Please contact support.")
+    except anthropic.APIConnectionError:
+        logger.error("Could not connect to Anthropic API")
+        raise HTTPException(status_code=503, detail="AI service is temporarily unavailable. Please try again shortly.")
+    except anthropic.RateLimitError:
+        logger.warning("Rate limit hit")
+        raise HTTPException(status_code=503, detail="Service is busy. Please try again in a moment.")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail="Something went wrong processing your request.")
 
     answer_text = message.content[0].text
-
-    # Save Claude's reply into the history too, so the next turn has it
     history.append({"role": "assistant", "content": answer_text})
     conversation_store[query.session_id] = history
+
+    logger.info(f"Session {query.session_id}: response sent successfully")
 
     return ClinicalResponse(
         answer=answer_text,
@@ -64,3 +79,36 @@ async def ask_clinical(query: ClinicalQuery):
         question_received=query.question,
         session_id=query.session_id
     )
+ # Minimal HTML test client — visit http://localhost:8000/
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    return """
+    <html>
+    <head><title>Clinical AI Assistant</title></head>
+    <body style="font-family: sans-serif; max-width: 600px; margin: 40px auto;">
+        <h2>Clinical Decision Support Assistant</h2>
+        <input id="question" type="text" placeholder="Ask a clinical question..." style="width: 100%; padding: 8px;">
+        <button onclick="ask()" style="margin-top: 8px; padding: 8px 16px;">Ask</button>
+        <p id="answer" style="margin-top: 20px; white-space: pre-wrap;"></p>
+
+        <script>
+        async function ask() {
+            const question = document.getElementById('question').value;
+            document.getElementById('answer').innerText = "Thinking...";
+            const res = await fetch('/ask', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({session_id: 'demo-session', question: question})
+            });
+            if (!res.ok) {
+                const err = await res.json();
+                document.getElementById('answer').innerText = "Error: " + err.detail;
+                return;
+            }
+            const data = await res.json();
+            document.getElementById('answer').innerText = data.answer;
+        }
+        </script>
+    </body>
+    </html>
+    """
